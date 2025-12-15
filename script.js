@@ -41,107 +41,199 @@
         });
 
         // Static-friendly YouTube fetch (client-side).
-        // Fallback order:
-        // 1) If an API key is provided (data-yt-api-key), call YouTube Data API (note: exposes key in static site).
-        // 2) Try to fetch the channel "about" page and parse subscriber count from HTML (may be blocked by CORS).
-        // 3) Try jina.ai HTML proxy as a last-resort text proxy.
-        async function fetchYouTubeSubs(channelId, apiKey){
-          if(!channelId) return 0;
-          // Helper to call channels.statistics once we have a channelId
-          async function fetchStatsByChannelId(id){
-            try{
-              const url = `https://www.googleapis.com/youtube/v3/channels?part=statistics&id=${encodeURIComponent(id)}&key=${encodeURIComponent(apiKey)}`;
-              const res = await fetch(url);
-              if(!res.ok) return null;
-              const j = await res.json();
-              const item = j.items && j.items[0];
-              if(item && item.statistics){
-                // prefer subscriberCount; ensure it's not hidden
-                if(item.statistics.hiddenSubscriberCount) return null;
-                return parseInt(item.statistics.subscriberCount || 0, 10) || 0;
-              }
-            }catch(e){ /* ignore */ }
-            return null;
+        // This implementation accepts full YouTube URLs, handles (@name), channel IDs (UC...),
+        // and plain names. Priority:
+        // 1) Try a local server proxy endpoint `/api/youtube-subs?identifier=...` if available.
+        // 2) If `apiKey` is provided, use YouTube Data API to resolve and fetch `statistics.subscriberCount`.
+        // 3) As a last resort, attempt to fetch the channel About page and parse subscriber text.
+        async function fetchYouTubeSubs(identifier, apiKey){
+          if(!identifier) return 0;
+
+          // Helpers
+          function extractNumber(str){
+            if(!str) return 0;
+            const m = String(str).replace(/\u00A0/g,' ').match(/([0-9][0-9,\.\s]*)/);
+            if(!m) return 0;
+            return parseInt(m[1].replace(/[^0-9]/g,''), 10) || 0;
           }
 
-          // 1) YouTube Data API (requires API key)
+          function parseSubscribersFromHTML(html){
+            if(!html) return 0;
+            try{
+              if(typeof DOMParser !== 'undefined'){
+                const doc = new DOMParser().parseFromString(html, 'text/html');
+                // Prefer span elements containing 'subscriber'
+                const spans = doc.querySelectorAll('span');
+                for(const s of spans){
+                  const t = (s.textContent || '').trim();
+                  if(/subscriber/i.test(t)){
+                    const n = extractNumber(t);
+                    if(n) return n;
+                  }
+                }
+                // fallback: search any metadata-like containers
+                const candidates = doc.querySelectorAll('[class*="metadata"], [class*="attributed"], [class*="yt-core"]');
+                for(const c of candidates){
+                  const t = (c.textContent || '').trim();
+                  if(/subscriber/i.test(t)){
+                    const n = extractNumber(t);
+                    if(n) return n;
+                  }
+                }
+              }
+            }catch(e){ /* ignore DOM parse errors */ }
+            // final fallback: regex
+            const m = html.match(/<span[^>]*>([0-9,\.\s]+)\s*subscribers<\/span>/i) || html.match(/([0-9,\.\s]+)\s*subscribers/i);
+            if(m) return extractNumber(m[1] || m[0]);
+            return 0;
+          }
+
+          function isChannelId(s){
+            return /^UC[a-zA-Z0-9_-]{20,}$/.test(s);
+          }
+
+          function normalizeIdentifier(input){
+            const v = String(input).trim();
+            // Full URL? extract the path segment
+            try{
+              if(/^https?:\/\//i.test(v)){
+                const u = new URL(v);
+                const p = u.pathname.replace(/^\/+/, '').split('/');
+                // patterns: /channel/UC..., /c/Name, /user/Name, /@handle
+                if(p[0] === 'channel' && p[1]) return p[1];
+                if(p[0] === 'c' && p[1]) return p[1];
+                if(p[0] === 'user' && p[1]) return p[1];
+                // handle like /@handle
+                const m = u.pathname.match(/@[^\/]+/);
+                if(m) return m[0];
+                // if the URL contains a query to channel, try to find it
+                if(u.searchParams && u.searchParams.get('channel_id')) return u.searchParams.get('channel_id');
+                // otherwise return the last non-empty segment
+                for(let i = p.length - 1; i >= 0; i--){ if(p[i]) return p[i]; }
+              }
+            }catch(e){ /* not a url */ }
+            return v;
+          }
+
+          const id = normalizeIdentifier(identifier);
+
+          // 1) Try server-side proxy first (if available). Expect JSON { subscriberCount: N }
+          try{
+            const proxyRes = await fetch(`/api/youtube-subs?identifier=${encodeURIComponent(id)}`);
+            if(proxyRes.ok){
+              const pj = await proxyRes.json();
+              const val = pj.subscriberCount || pj.subscribers || pj.count || pj.subscriber_count || 0;
+              if(Number(val)) return Number(val);
+            }
+          }catch(e){ /* no proxy or network error; continue */ }
+
+          // 2) If API key provided, use YouTube Data API
           if(apiKey){
             try{
-              let resolvedId = channelId;
-              // If identifier looks like a handle (starts with @) or doesn't look like a channel ID (UC...)
-              if(/^@/.test(channelId) || !/^UC[a-zA-Z0-9_-]{20,}$/.test(channelId)){
-                // try to resolve via search by query (strip leading @ for handles)
-                const q = encodeURIComponent(channelId.replace(/^@/, ''));
+              let channelId = id;
+              // If id isn't a channelId, resolve via search
+              if(!isChannelId(id)){
+                const q = encodeURIComponent(id.replace(/^@/, ''));
                 const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q=${q}&maxResults=1&key=${encodeURIComponent(apiKey)}`;
                 const sres = await fetch(searchUrl);
                 if(sres.ok){
                   const sj = await sres.json();
                   const ch = sj.items && sj.items[0];
-                  if(ch && ch.snippet && ch.snippet.channelId) resolvedId = ch.snippet.channelId;
+                  if(ch && ch.snippet && ch.snippet.channelId) channelId = ch.snippet.channelId;
                 }
               }
-
-              const stats = await fetchStatsByChannelId(resolvedId);
-              if(Number.isFinite(stats)) return stats;
-            }catch(e){ /* ignore and fallback */ }
+              // Fetch statistics
+              if(isChannelId(channelId)){
+                const url = `https://www.googleapis.com/youtube/v3/channels?part=statistics&id=${encodeURIComponent(channelId)}&key=${encodeURIComponent(apiKey)}`;
+                const r = await fetch(url);
+                if(r.ok){
+                  const j = await r.json();
+                  const item = j.items && j.items[0];
+                  if(item && item.statistics && !item.statistics.hiddenSubscriberCount){
+                    return parseInt(item.statistics.subscriberCount || 0, 10) || 0;
+                  }
+                }
+              }
+            }catch(e){ /* ignore API errors and fall back */ }
           }
 
-          // helper to extract number from strings like "1,234 subscribers" or JSON snippets
-          function extractNumber(str){
-            if(!str) return 0;
-            const m = str.replace(/\u00A0/g,' ').match(/([0-9][0-9,\.\s]*)/);
-            if(!m) return 0;
-            return parseInt(m[1].replace(/[^0-9]/g,''), 10) || 0;
+          // 3) Try direct about-page fetches (best-effort; may be blocked by CORS)
+          const candidates = [];
+          if(isChannelId(id)) candidates.push(`https://www.youtube.com/channel/${id}/about`);
+          // handle may start with @
+          if(/^@/.test(id)){
+            candidates.push(`https://www.youtube.com/${id}/about`);
+            candidates.push(`https://www.youtube.com/c/${id.replace(/^@/, '')}/about`);
+            candidates.push(`https://www.youtube.com/user/${id.replace(/^@/, '')}/about`);
+          } else {
+            candidates.push(`https://www.youtube.com/c/${id}/about`);
+            candidates.push(`https://www.youtube.com/user/${id}/about`);
+            candidates.push(`https://www.youtube.com/${id}/about`);
           }
 
-          // 2) Try fetching the channel about page directly
-          const aboutUrls = [
-            `https://www.youtube.com/channel/${channelId}/about`,
-            `https://www.youtube.com/user/${channelId}/about`,
-            `https://www.youtube.com/c/${channelId}/about`
-          ];
-
-          for(const u of aboutUrls){
+          for(const u of candidates){
             try{
               const res = await fetch(u, { mode: 'cors' });
               if(!res.ok) continue;
               const text = await res.text();
-              // Common patterns
-              let m = text.match(/"subscriberCountText"\s*:\s*\{[^}]*"simpleText"\s*:\s*"([^"]+)"/);
-              if(!m) m = text.match(/"subscriberCountText"\s*:\s*\{[^}]*"runs"\s*:\s*\[\{[^}]*"text"\s*:\s*"([^"]+)"/);
-              if(!m) m = text.match(/(\d[0-9,\.\s]*)\s*subscribers/gi);
-              if(m){
-                const val = Array.isArray(m) ? m[1] || m[0] : m[0];
-                const n = extractNumber(val);
-                if(n) return n;
+              // prefer parsing ytInitialData if present
+              const mJson = text.match(/ytInitialData\s*=\s*(\{[\s\S]*?\});/);
+              if(mJson && mJson[1]){
+                try{
+                  const obj = JSON.parse(mJson[1]);
+                  // recursive search for subscriberCountText
+                  function findSubscriberText(node){
+                    if(!node || typeof node !== 'object') return null;
+                    if(node.subscriberCountText){
+                      const s = node.subscriberCountText;
+                      if(typeof s.simpleText === 'string') return s.simpleText;
+                      if(Array.isArray(s.runs) && s.runs[0] && s.runs[0].text) return s.runs[0].text;
+                    }
+                    for(const k in node){
+                      if(!Object.prototype.hasOwnProperty.call(node,k)) continue;
+                      try{ const found = findSubscriberText(node[k]); if(found) return found;}catch(e){}
+                    }
+                    return null;
+                  }
+                  const subText = findSubscriberText(obj);
+                  if(subText && /subscriber/i.test(String(subText)) && !/video/i.test(String(subText))){
+                    const n = extractNumber(subText);
+                    if(n) return n;
+                  }
+                }catch(e){ /* JSON parse error - continue */ }
               }
-            }catch(e){ /* CORS or network error: continue to next */ }
+              // fallback to DOM/regex parse
+              const parsed = parseSubscribersFromHTML(text);
+              if(parsed) return parsed;
+            }catch(e){ /* CORS or network error; try next candidate */ }
           }
-
-          // 3) Try jina.ai text proxy (third-party) as last resort
-          try{
-            const proxy = `https://r.jina.ai/http://www.youtube.com/channel/${channelId}/about`;
-            const res = await fetch(proxy);
-            if(res.ok){
-              const text = await res.text();
-              const m = text.match(/subscriber[s]?\W*([0-9,\.\s]+)/i) || text.match(/([0-9,\.\s]+)\s*subscribers/i);
-              if(m){
-                return extractNumber(m[1] || m[0]);
-              }
-            }
-          }catch(e){ /* ignore */ }
 
           return 0;
         }
 
         async function fetchDiscordMembers(guildId){
           if(!guildId) return 0;
+          // 1) Try server-side proxy (keeps tokens secret)
           try{
             const res = await fetch(`/api/discord-members?guildId=${encodeURIComponent(guildId)}`);
-            if(!res.ok) return 0;
-            const j = await res.json();
-            return j.memberCount || 0;
-          }catch(e){ return 0; }
+            if(res.ok){
+              const j = await res.json();
+              return j.memberCount || j.approximate_member_count || j.presence_count || 0;
+            }
+          }catch(e){ /* ignore and fallback to public endpoints */ }
+
+          // 2) Try Discord public widget JSON (works if widget is enabled)
+          try{
+            const url = `https://discord.com/api/guilds/${encodeURIComponent(guildId)}/widget.json`;
+            const res = await fetch(url, { mode: 'cors' });
+            if(res.ok){
+              const j = await res.json();
+              // widget may provide presence_count or members array
+              return j.presence_count || j.approximate_member_count || (Array.isArray(j.members) ? j.members.length : 0) || 0;
+            }
+          }catch(e){ /* likely CORS or network error; continue to proxy fallback */ }
+
+          return 0;
         }
 
         async function updateCounts(chEl){
