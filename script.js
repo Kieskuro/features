@@ -11,6 +11,20 @@
           hideEl.classList.add('hidden');
         }
 
+        // Format large numbers as short strings (e.g. 1.2K, 3.4M, 5B)
+        function formatShort(n){
+          const num = Number(n) || 0;
+          const abs = Math.abs(num);
+          let v, suffix = '';
+          if (abs >= 1e9) { v = (num / 1e9).toFixed(1); suffix = 'B'; }
+          else if (abs >= 1e6) { v = (num / 1e6).toFixed(1); suffix = 'M'; }
+          else if (abs >= 1e3) { v = (num / 1e3).toFixed(1); suffix = 'K'; }
+          else { return String(num); }
+          // strip trailing .0
+          v = v.replace(/\.0$/, '');
+          return v + suffix;
+        }
+
         // initialize: show ch1, hide ch2
         ch1.classList.remove('hidden');
         ch2.classList.add('hidden');
@@ -33,18 +47,42 @@
         // 3) Try jina.ai HTML proxy as a last-resort text proxy.
         async function fetchYouTubeSubs(channelId, apiKey){
           if(!channelId) return 0;
+          // Helper to call channels.statistics once we have a channelId
+          async function fetchStatsByChannelId(id){
+            try{
+              const url = `https://www.googleapis.com/youtube/v3/channels?part=statistics&id=${encodeURIComponent(id)}&key=${encodeURIComponent(apiKey)}`;
+              const res = await fetch(url);
+              if(!res.ok) return null;
+              const j = await res.json();
+              const item = j.items && j.items[0];
+              if(item && item.statistics){
+                // prefer subscriberCount; ensure it's not hidden
+                if(item.statistics.hiddenSubscriberCount) return null;
+                return parseInt(item.statistics.subscriberCount || 0, 10) || 0;
+              }
+            }catch(e){ /* ignore */ }
+            return null;
+          }
+
           // 1) YouTube Data API (requires API key)
           if(apiKey){
             try{
-              const url = `https://www.googleapis.com/youtube/v3/channels?part=statistics&id=${encodeURIComponent(channelId)}&key=${encodeURIComponent(apiKey)}`;
-              const res = await fetch(url);
-              if(res.ok){
-                const j = await res.json();
-                const item = j.items && j.items[0];
-                if(item && item.statistics && !item.statistics.hiddenSubscriberCount){
-                  return parseInt(item.statistics.subscriberCount || 0, 10) || 0;
+              let resolvedId = channelId;
+              // If identifier looks like a handle (starts with @) or doesn't look like a channel ID (UC...)
+              if(/^@/.test(channelId) || !/^UC[a-zA-Z0-9_-]{20,}$/.test(channelId)){
+                // try to resolve via search by query (strip leading @ for handles)
+                const q = encodeURIComponent(channelId.replace(/^@/, ''));
+                const searchUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q=${q}&maxResults=1&key=${encodeURIComponent(apiKey)}`;
+                const sres = await fetch(searchUrl);
+                if(sres.ok){
+                  const sj = await sres.json();
+                  const ch = sj.items && sj.items[0];
+                  if(ch && ch.snippet && ch.snippet.channelId) resolvedId = ch.snippet.channelId;
                 }
               }
+
+              const stats = await fetchStatsByChannelId(resolvedId);
+              if(Number.isFinite(stats)) return stats;
             }catch(e){ /* ignore and fallback */ }
           }
 
@@ -115,9 +153,25 @@
           const base = parseInt(h1 && h1.dataset.baseCount || 0, 10) || 0;
           const [subs, members] = await Promise.all([fetchYouTubeSubs(yt, ytKey), fetchDiscordMembers(dc)]);
           const total = base + (Number(subs) || 0) + (Number(members) || 0);
-          if(h1) h1.textContent = `${total} Followers`;
+          if(h1) h1.textContent = `${formatShort(total)} Followers`;
         }
 
-        // initial count fetch for visible channel (ch1)
-        updateCounts(ch1);
+        // Initialize counts from HTML `data-base-count`, then fetch live updates
+        (async function initCountsFromHTML(){
+          try{
+            const h1a = ch1.querySelector('h1');
+            const h1b = ch2.querySelector('h1');
+            if(h1a){
+              const base = parseInt(h1a.dataset.baseCount || 0, 10) || 0;
+              h1a.textContent = `${formatShort(base)} Followers`;
+            }
+            if(h1b){
+              const base = parseInt(h1b.dataset.baseCount || 0, 10) || 0;
+              h1b.textContent = `${formatShort(base)} Followers`;
+            }
+          }catch(e){ /* ignore */ }
+
+          // Fetch live counts for the currently visible channel
+          await updateCounts(ch1);
+        })();
       })();

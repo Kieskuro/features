@@ -1,4 +1,12 @@
 
+@font-face {
+    font-family: 'Itim';
+    src: url('Nunito.ttf') format('truetype');
+}
+@font-face {
+    font-family: 'Holtwood One SC';
+    src: url('Bauhaus93.ttf') format('truetype');
+}
 /* For width 1024px and larger: */
 @media only screen and (min-width: 1765px) {
 grid{
